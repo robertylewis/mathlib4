@@ -51,6 +51,7 @@ theorem pf_div_c [Div α] (p : a = b) (c : α) : a / c = b / c := p ▸ rfl
 theorem c_div_pf [Div α] (p : b = c) (a : α) : a / b = a / c := p ▸ rfl
 theorem div_pf [Div α] (p₁ : (a₁:α) = b₁) (p₂ : a₂ = b₂) : a₁ / a₂ = b₁ / b₂ := p₁ ▸ p₂ ▸ rfl
 
+
 /--
 Performs macro expansion of a linear combination expression,
 using `+`/`-`/`*`/`/` on equations and values.
@@ -106,28 +107,46 @@ partial def expandLinearCombo (stx : Syntax.Term) : TermElabM (Option Syntax.Ter
     some <$> e.toSyntax
   return result.map fun r => ⟨r.raw.setInfo (SourceInfo.fromRef stx true)⟩
 
-/-- A configuration object for `linear_combination`. -/
-structure Config where
-  /-- whether or not the normalization step should be used -/
-  normalize := true
-  /-- whether to make separate subgoals for both sides or just one for `lhs - rhs = 0` -/
-  twoGoals := false
-  /-- the tactic used for normalization when checking
-  if the weighted sum is equivalent to the goal (when `normalize` is `true`). -/
-  normTac : Syntax.Tactic := Unhygienic.run `(tactic| ring_nf)
-  deriving Inhabited
+#check pow_eq_zero
+#check Tactic.refineCore
+
+def raiseGoalToPower : Term → Tactic.TacticM Unit
+| `((1 : ℕ)) => do Tactic.evalTactic <| ← withFreshMacroScope `(tactic| (skip))
+| n => do Tactic.evalTactic <| ← withFreshMacroScope `(tactic| refine @pow_eq_zero _ _ _ _ $n _)
+
+
+#check `(tactic| refine @pow_eq_zero _ _ _ _ n _)
+-- /-- A configuration object for `linear_combination`. -/
+-- structure Config where
+--   /-- whether or not the normalization step should be used -/
+--   normalize := true
+--   /-- whether to make separate subgoals for both sides or just one for `lhs - rhs = 0` -/
+--   twoGoals := false
+--   /-- the tactic used for normalization when checking
+--   if the weighted sum is equivalent to the goal (when `normalize` is `true`). -/
+--   normTac : Syntax.Tactic := Unhygienic.run `(tactic| ring_nf)
+--   /-- if the exponent is not 1, raise both sides of the goal to this power before
+--   subtracting the linear combination -/
+--   exponent : ℕ := 1
+--   deriving Inhabited
+
 
 /-- Function elaborating `LinearCombination.Config` -/
-declare_config_elab elabConfig Config
+-- declare_config_elab elabConfig Config
 
 theorem eq_trans₃ (p : (a:α) = b) (p₁ : a = a') (p₂ : b = b') : a' = b' := p₁ ▸ p₂ ▸ p
 
 theorem eq_of_add [AddGroup α] (p : (a:α) = b) (H : (a' - b') - (a - b) = 0) : a' = b' := by
   rw [← sub_eq_zero] at p ⊢; rwa [sub_eq_zero, p] at H
 
+
+theorem eq_of_add_pow [Ring α] [NoZeroDivisors α] (n : ℕ) (p : (a:α) = b) (H : (a' - b')^n - (a - b) = 0) :
+  a' = b' := by
+  rw [← sub_eq_zero] at p ⊢; apply pow_eq_zero (n := n); rwa [sub_eq_zero, p] at H
+
 /-- Implementation of `linear_combination` and `linear_combination2`. -/
 def elabLinearCombination
-    (norm? : Option Syntax.Tactic) (input : Option Syntax.Term)
+    (norm? : Option Syntax.Tactic) (exp? : Option Syntax.NumLit) (input : Option Syntax.Term)
     (twoGoals := false) : Tactic.TacticM Unit := Tactic.withMainContext do
   let p ← match input with
   | none => `(Eq.refl 0)
@@ -136,13 +155,23 @@ def elabLinearCombination
     | none => `(Eq.refl $e)
     | some p => pure p
   let norm := norm?.getD (Unhygienic.run `(tactic| ring1))
-  Tactic.evalTactic <|← withFreshMacroScope <| if twoGoals then
-    `(tactic| (
+
+  if twoGoals then
+    Tactic.evalTactic <|← withFreshMacroScope <| `(tactic| (
       refine eq_trans₃ $p ?a ?b
       case' a => $norm:tactic
       case' b => $norm:tactic))
   else
-    `(tactic| (refine eq_of_add $p ?a; case' a => $norm:tactic))
+    let t : Syntax ← match exp? with
+    | some n =>
+      let exp := n.getNat
+      if exp = 1 then `(tactic| (refine eq_of_add $p ?a)) else `(tactic| (refine eq_of_add_pow $n $p ?a))
+    | _ => `(tactic| (refine eq_of_add $p ?a))
+    Tactic.evalTactic <| ← withFreshMacroScope <|
+      `(tactic| ($t; $norm:tactic))
+
+#check pow_eq_zero
+#check Tactic.refineCore
 
 /--
 The `(norm := $tac)` syntax says to use `tac` as a normalization postprocessor for
@@ -150,6 +179,9 @@ The `(norm := $tac)` syntax says to use `tac` as a normalization postprocessor f
 to get subgoals from `linear_combination` or with `skip` to disable normalization.
 -/
 syntax normStx := atomic(" (" &"norm" " := ") withoutPosition(tactic) ")"
+
+syntax expStx := atomic(" (" &"exp" " := ") withoutPosition(num) ")"
+
 
 /--
 `linear_combination` attempts to simplify the target by creating a linear combination
@@ -218,11 +250,24 @@ example (a b : ℚ) (h : ∀ p q : ℚ, p = q) : 3*a + qc = 3*b + 2*qc := by
   linear_combination 3 * h a b + hqc
 ```
 -/
-syntax (name := linearCombination) "linear_combination" (normStx)? (ppSpace colGt term)? : tactic
+syntax (name := linearCombination) "linear_combination" (normStx)? (expStx)? (ppSpace colGt term)? : tactic
 elab_rules : tactic
-  | `(tactic| linear_combination $[(norm := $tac)]? $(e)?) => elabLinearCombination tac e
+  | `(tactic| linear_combination $[(norm := $tac)]? $[(exp := $n)]? $(e)?) => elabLinearCombination tac n e
 
 @[inherit_doc linearCombination]
 syntax "linear_combination2" (normStx)? (ppSpace colGt term)? : tactic
 elab_rules : tactic
-  | `(tactic| linear_combination2 $[(norm := $tac)]? $(e)?) => elabLinearCombination tac e true
+  | `(tactic| linear_combination2 $[(norm := $tac)]? $(e)?) => elabLinearCombination tac none e true
+
+
+example (x y z : ℤ) (h : x = y) : 2*x = 2*y := by
+  linear_combination  (exp := 1) 2*h
+
+
+
+example (x y z : ℚ) (h : x = y) (h2 : x * y = 0) : x + y*z = 0 :=
+by linear_combination (exp := 2) (-y * z ^ 2 + x) * h + (z ^ 2 + 2 * z + 1) * h2
+
+
+#synth MonoidWithZero ℤ
+#synth NoZeroDivisors ℤ
